@@ -19,6 +19,9 @@ ECB_SERIES_START = date(1999, 1, 4)
 DEFAULT_UPSTREAM_BASE = "https://api.frankfurter.dev"
 UPSTREAM_TIMEOUT_SECONDS = 3.0
 
+# (from, to, asked_date) -> (rate, rate_date). Failures are not stored.
+_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
+
 
 class ConvertError(Exception):
     """A check failed. convert() turns this into {error, message}."""
@@ -238,6 +241,17 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
     return rate, rate_date
 
 
+def get_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
+    """Same pair + asked day reuses the stored rate. Amount is not in the key."""
+    key = (from_code, to_code, asked.isoformat())
+    cached = _cache.get(key)
+    if cached is not None:
+        return cached
+    rate, rate_date = fetch_rate(from_code, to_code, asked)
+    _cache[key] = (rate, rate_date)
+    return rate, rate_date
+
+
 @app.get("/tools/convert")
 def convert(
     amount: str | None = None,
@@ -256,7 +270,7 @@ def convert(
                 "from and to must be different currency codes.",
             )
         asked = parse_asked_date(date)
-        rate, rate_date = fetch_rate(from_code, to_code, asked)
+        rate, rate_date = get_rate(from_code, to_code, asked)
     except ConvertError as exc:
         return error_body(exc)
 
