@@ -22,6 +22,9 @@ UPSTREAM_TIMEOUT_SECONDS = 3.0
 # (from, to, asked_date) -> (rate, rate_date). Failures are not stored.
 _cache: dict[tuple[str, str, str], tuple[float, str]] = {}
 
+# Tests assign httpx.MockTransport here so pytest never opens a socket.
+_transport: httpx.BaseTransport | None = None
+
 
 class ConvertError(Exception):
     """A check failed. convert() turns this into {error, message}."""
@@ -170,7 +173,10 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
     """
     url = f"{upstream_base()}/v1/{asked.isoformat()}"
     try:
-        with httpx.Client(timeout=UPSTREAM_TIMEOUT_SECONDS) as client:
+        with httpx.Client(
+            timeout=UPSTREAM_TIMEOUT_SECONDS,
+            transport=_transport,
+        ) as client:
             response = client.get(
                 url,
                 params={"base": from_code, "symbols": to_code},
