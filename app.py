@@ -1,19 +1,27 @@
 """HTTP currency convert tool for an AI agent."""
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query
 
 # The application object uvicorn loads from this file.
 app = FastAPI(title="fx-convert")
 
+SOURCE = "ECB via frankfurter.dev"
+
 
 @app.get("/tools/convert")
-def convert() -> JSONResponse:
-    # Response for GET /tools/convert.
-    return JSONResponse(
-        status_code=501,
-        content={
-            "error": "not_implemented",
-            "message": "convert is not implemented yet.",
-        },
-    )
+def convert(
+    amount: float = Query(),
+    from_: str = Query(alias="from"),
+    to: str = Query(),
+    date: str = Query(),
+) -> dict:
+    return {
+        "amount": amount,
+        "from": from_,
+        "to": to,
+        "rate": None,
+        "result": None,
+        "rate_date": None,
+        "asked_date": date,
+        "source": SOURCE,
+    }
