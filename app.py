@@ -116,6 +116,47 @@ def upstream_base() -> str:
     return os.environ.get("FX_UPSTREAM_BASE", DEFAULT_UPSTREAM_BASE).rstrip("/")
 
 
+def upstream_message(response: httpx.Response) -> str:
+    """Best-effort text from an error body. Empty if it is not JSON."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    if isinstance(payload, dict):
+        return str(payload.get("message") or "")
+    return ""
+
+
+def raise_for_upstream_status(response: httpx.Response) -> None:
+    """Turn a non-2xx upstream reply into ConvertError. Never invent a rate."""
+    if response.status_code < 400:
+        return
+
+    message = upstream_message(response)
+    lowered = message.lower()
+
+    # Frankfurter often answers 404 "not found" for an unknown code.
+    # Dates we cannot serve are already rejected in parse_asked_date, and
+    # weekends/holidays are 200 with an earlier "date", not 404.
+    if "currency" in lowered or response.status_code == 404:
+        raise ConvertError(
+            400,
+            "invalid_currency",
+            "the currency code is not published by the ECB.",
+        )
+    if response.status_code >= 500:
+        raise ConvertError(
+            502,
+            "upstream_error",
+            "the rate source returned an error; no rate was used.",
+        )
+    raise ConvertError(
+        502,
+        "upstream_error",
+        "the rate source rejected the request; no rate was used.",
+    )
+
+
 def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
     """Return (rate, rate_date) from the upstream JSON.
 
@@ -131,16 +172,42 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
                 url,
                 params={"base": from_code, "symbols": to_code},
             )
-            payload = response.json()
-    except httpx.HTTPError as exc:
+    except httpx.TimeoutException as exc:
+        # Slow source: fail closed. A late number is not worth guessing.
+        raise ConvertError(
+            504,
+            "upstream_timeout",
+            "the rate source did not answer in time; no rate was used.",
+        ) from exc
+    except httpx.RequestError as exc:
+        # DNS failure, connection refused, and similar.
         raise ConvertError(
             502,
             "upstream_error",
-            "the rate source could not be used; no rate was returned.",
+            "the rate source could not be reached; no rate was used.",
         ) from exc
 
-    rates = payload.get("rates") if isinstance(payload, dict) else None
-    rate_date = payload.get("date") if isinstance(payload, dict) else None
+    raise_for_upstream_status(response)
+
+    # Parse JSON only after a 2xx. HTML or empty bodies must not become a rate.
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ConvertError(
+            502,
+            "upstream_error",
+            "the rate source did not return JSON; no rate was used.",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise ConvertError(
+            502,
+            "upstream_error",
+            "the rate source returned an unexpected body; no rate was used.",
+        )
+
+    rates = payload.get("rates")
+    rate_date = payload.get("date")
     if not isinstance(rates, dict) or to_code not in rates:
         raise ConvertError(
             400,
