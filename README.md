@@ -1,129 +1,74 @@
-# Case study — Junior Software Engineer at mangolab
+# fx-convert
 
-Two small tasks, **about two and a half hours in total.** Please do not spend
-your weekend on this. If you run out of time, stop and write down what you would
-have done next — that answer counts too.
+HTTP tool for an AI agent that needs a **historical ECB conversion**, not a guess.
 
-Use Claude Code, Cursor, Copilot — whatever you normally use. That is how we work
-every day, and we would rather see you use it well than watch you avoid it. The
-only thing we ask is that you know your own code.
-
-**Start by clicking "Use this template"** to create your own repository, then
-work there.
-
----
-
-## Part A — build (about 90 minutes)
-
-A small HTTP service — Python + FastAPI preferred, TypeScript is fine — with one
-endpoint an AI agent could call as a tool:
+Call this when a customer asks something like “how much is 250 euros in lira on 28 August 2026?” You send `amount`, `from`, `to`, and `date`. You get back a rate you can quote, or an error you must not turn into a number.
 
 ```
 GET /tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28
 ```
 
-It answers using the public [Frankfurter API](https://frankfurter.dev) —
-European Central Bank rates, no API key, no signup.
+How to talk to the customer from the response:
 
-### Three things are fixed, so that we can run every submission the same way
+- **`200`** — use `result` as the converted amount and `rate` as the ECB rate. If `rate_date` differs from `asked_date` (weekend or holiday), say the figure is from `rate_date`, not the day they asked for. Do not imply ECB published a rate on a day they did not.
+- **Non-2xx** — read `error` and `message`. Tell the customer you could not convert. Never invent a rate, and never treat a missing rate as zero.
 
-| | |
+Rates come from Frankfurter v1 (ECB). A wrong number is worse than no number.
+
+## Run
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # macOS and Linux
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+./run.sh                           # PORT defaults to 8080
+```
+
+`FX_UPSTREAM_BASE` defaults to `https://api.frankfurter.dev`. The host is never hardcoded; set this env var to point at another upstream.
+
+## Test
+
+```bash
+./test.sh
+```
+
+Tests fake the upstream (`httpx.MockTransport`) and pass with no network, including when `FX_UPSTREAM_BASE` is a closed port.
+
+## Success
+
+`200` with `amount`, `from`, `to`, `rate`, `result`, `rate_date`, `asked_date`, `source`.
+
+- `asked_date` is what the caller sent.
+- `rate_date` is the date field from the upstream JSON — the day the rate actually belongs to.
+- The rate is not rounded before multiplying. `result` is rounded to 2 decimal places.
+
+## Errors
+
+Non-2xx with `{ "error": "<code>", "message": "<sentence>" }`.
+
+| Code | Status | When |
+|---|---|---|
+| `invalid_amount` | 400 | Missing, not a number, zero, negative, or more than 6 decimal places |
+| `invalid_currency` | 400 | Missing/malformed code, or not published by the ECB |
+| `same_currency` | 400 | `from` and `to` are the same |
+| `invalid_date` | 400 | Missing or not `YYYY-MM-DD` |
+| `date_in_future` | 400 | After today (UTC) |
+| `date_out_of_range` | 400 | Before the ECB euro series (`1999-01-04`) |
+| `upstream_timeout` | 504 | Upstream did not answer within 3 seconds |
+| `upstream_error` | 502 | Unreachable, HTTP 5xx, or a body that is not usable JSON |
+
+## Behaviour
+
+| Case | What we do |
 |---|---|
-| Upstream URL | from the `FX_UPSTREAM_BASE` environment variable, defaulting to `https://api.frankfurter.dev`. **Nothing may hardcode the real host** — we point this at a fake upstream when reviewing. |
-| Port | from the `PORT` environment variable, default `8080` |
-| Scripts | `./run.sh` starts the service, `./test.sh` runs the tests. Both are in this template, unimplemented. |
+| Weekend / holiday | Return the last published ECB rate. `rate_date` is that earlier day; `asked_date` stays what was asked. We do not call `/latest` and stamp today’s rate on the asked day. |
+| Future date | Refuse (`date_in_future`). |
+| Date before the series | Refuse (`date_out_of_range`). |
+| Unknown currency | Refuse (`invalid_currency`). Frankfurter’s 404 `"not found"` is treated as this, because dates we cannot serve are already rejected locally. |
+| `from == to` | Refuse (`same_currency`). We do not return `1.0`. |
+| Slow / 500 / non-JSON | Refuse (`upstream_timeout` or `upstream_error`). Never `rate: 0`. |
+| Bad amount | Refuse (`invalid_amount`). |
+| Repeat question | Same pair + asked date is served from an in-memory cache. Amount is not part of the key. Failures are not cached. |
 
-### The response
-
-On success, 200 with:
-
-```json
-{
-  "amount": 250,
-  "from": "EUR",
-  "to": "TRY",
-  "rate": 47.1234,
-  "result": 11780.85,
-  "rate_date": "2026-08-28",
-  "asked_date": "2026-08-28",
-  "source": "ECB via frankfurter.dev"
-}
-```
-
-`rate_date` is **the date the rate you used actually belongs to.** `asked_date`
-is what the caller asked for. They are not always the same, and that difference
-is the point of this task.
-
-On failure, a non-2xx status and:
-
-```json
-{ "error": "<short_machine_code>", "message": "<a sentence a person could read>" }
-```
-
-List your error codes in your README.
-
-### The part that matters
-
-The caller is a language model talking to a paying customer, so **a wrong number
-is worse than no number.** Decide — and implement — what happens when:
-
-- the ECB published no rate for the date asked (weekends, holidays);
-- the date is in the future, or before the series starts;
-- the currency code does not exist, or `from` and `to` are the same;
-- the upstream is slow, returns 500, or returns something that is not JSON;
-- `amount` is missing, zero, negative, or has ten decimal places.
-
-Your endpoint must never invent a rate, and must never present a rate as
-belonging to a date it does not belong to. Note that the upstream itself tells
-you which date its rates are from — read it. If you choose to answer with an
-earlier published rate, the response has to make that visible, because the model
-has to be able to tell the customer which day the number is from.
-
-### Also required
-
-- **Tests that pass with no network at all** — fake the upstream. We run
-  `./test.sh` with `FX_UPSTREAM_BASE` pointing at a closed port.
-- A README of your own we can follow in under a minute: how to run it, how to
-  run the tests, your error codes, and what your endpoint does in each of the
-  cases above.
-- A repeat of the same question should not re-ask the upstream.
-- `NOTES.md`, one page. The skeleton is in this repo.
-
-### Not required, not scored
-
-Auth, a database, a UI, a Dockerfile, CI, deployment, more endpoints. Adding them
-will not help you; a smaller thing done carefully will.
-
----
-
-## Part B — review (about 45 minutes)
-
-`tool.py` in this repository is a working version of the same service, written
-quickly with an AI assistant. It runs. **Review it as if it were going live
-tomorrow for a customer who pays us.**
-
-Fill in `REVIEW.md`, one page:
-
-- what is wrong, and what it does to a **customer** — not to a linter;
-- how you would verify each finding;
-- your findings **ranked**, and which single one you would fix before shipping
-  tonight.
-
-Fewer findings, ranked and explained, beat a long list. If something looks
-suspicious but is actually fine, saying so is worth as much as finding a real
-defect.
-
----
-
-## Submitting
-
-Reply to our email with a link to your repository. Commit in small steps — the
-history is part of what we read. Five days is plenty; if you need more, just say
-so.
-
-Any question about this brief, ask. An unclear requirement is our fault, not a
-test.
-
----
-
-<sub>mangolab — Mango Yazılım Teknolojileri Ltd. Şti. · [mangolab.ai/careers](https://mangolab.ai/careers)</sub>
+`tool.py` is not this service. It is the Part B review sample.
