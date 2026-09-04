@@ -216,6 +216,13 @@ def convert_error_from_validation(exc: ValidationError) -> ConvertError:
     return ConvertError(400, "invalid_amount", message)
 
 
+class UpstreamRates(BaseModel):
+    """Frankfurter v1 success body. Extra keys (amount, base) are ignored."""
+
+    date: date
+    rates: dict[str, float]
+
+
 def upstream_message(response: httpx.Response) -> str:
     """Best-effort text from an error body. Empty if it is not JSON."""
     try:
@@ -302,43 +309,29 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
             "the rate source did not return JSON; no rate was used.",
         ) from exc
 
-    if not isinstance(payload, dict):
+    try:
+        body = UpstreamRates.model_validate(payload)
+    except ValidationError as exc:
         raise ConvertError(
             502,
             "upstream_error",
             "the rate source returned an unexpected body; no rate was used.",
-        )
+        ) from exc
 
-    rates = payload.get("rates")
-    rate_date = payload.get("date")
-    if not isinstance(rates, dict) or to_code not in rates:
+    if to_code not in body.rates:
         raise ConvertError(
             400,
             "invalid_currency",
             f"{to_code} is not a published ECB quote for this request.",
         )
-    if not isinstance(rate_date, str) or not rate_date:
-        raise ConvertError(
-            502,
-            "upstream_error",
-            "the rate source did not say which date the rate belongs to.",
-        )
-
-    try:
-        rate = float(rates[to_code])
-    except (TypeError, ValueError) as exc:
-        raise ConvertError(
-            502,
-            "upstream_error",
-            "the rate source returned a rate that is not a number.",
-        ) from exc
+    rate = body.rates[to_code]
     if rate <= 0:
         raise ConvertError(
             502,
             "upstream_error",
             "the rate source returned a rate that cannot be used.",
         )
-    return rate, rate_date
+    return rate, body.date.isoformat()
 
 
 def get_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
