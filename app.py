@@ -234,11 +234,8 @@ def upstream_message(response: httpx.Response) -> str:
     return ""
 
 
-def raise_for_upstream_status(response: httpx.Response) -> None:
-    """Turn a non-2xx upstream reply into ConvertError. Never invent a rate."""
-    if response.status_code < 400:
-        return
-
+def convert_error_from_http_status(response: httpx.Response) -> ConvertError:
+    """Map a 4xx/5xx that httpx already flagged. Never invent a rate."""
     message = upstream_message(response)
     lowered = message.lower()
 
@@ -246,18 +243,18 @@ def raise_for_upstream_status(response: httpx.Response) -> None:
     # Dates we cannot serve are already rejected in ConvertQuery, and
     # weekends/holidays are 200 with an earlier "date", not 404.
     if "currency" in lowered or response.status_code == 404:
-        raise ConvertError(
+        return ConvertError(
             400,
             "invalid_currency",
             "the currency code is not published by the ECB.",
         )
     if response.status_code >= 500:
-        raise ConvertError(
+        return ConvertError(
             502,
             "upstream_error",
             "the rate source returned an error; no rate was used.",
         )
-    raise ConvertError(
+    return ConvertError(
         502,
         "upstream_error",
         "the rate source rejected the request; no rate was used.",
@@ -282,6 +279,7 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
                 url,
                 params={"base": from_code, "symbols": to_code},
             )
+            response.raise_for_status()
     except httpx.TimeoutException as exc:
         # Slow source: fail closed. A late number is not worth guessing.
         raise ConvertError(
@@ -289,6 +287,8 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
             "upstream_timeout",
             "the rate source did not answer in time; no rate was used.",
         ) from exc
+    except httpx.HTTPStatusError as exc:
+        raise convert_error_from_http_status(exc.response) from exc
     except httpx.RequestError as exc:
         # DNS failure, connection refused, and similar.
         raise ConvertError(
@@ -296,8 +296,6 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
             "upstream_error",
             "the rate source could not be reached; no rate was used.",
         ) from exc
-
-    raise_for_upstream_status(response)
 
     # Parse JSON only after a 2xx. HTML or empty bodies must not become a rate.
     try:
