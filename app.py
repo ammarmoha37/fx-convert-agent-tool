@@ -7,6 +7,8 @@ from decimal import Decimal, InvalidOperation
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
+from pydantic_core import PydanticCustomError
 
 # The application object uvicorn loads from this file.
 app = FastAPI(title="fx-convert")
@@ -39,83 +41,6 @@ def error_body(exc: ConvertError) -> JSONResponse:
         status_code=exc.status_code,
         content={"error": exc.error, "message": exc.message},
     )
-
-
-def parse_amount(raw: str | None) -> Decimal:
-    if raw is None or raw.strip() == "":
-        raise ConvertError(
-            400,
-            "invalid_amount",
-            "amount is required and must be a number greater than zero.",
-        )
-    try:
-        value = Decimal(raw.strip())
-    except InvalidOperation as exc:
-        raise ConvertError(
-            400,
-            "invalid_amount",
-            "amount must be a number greater than zero.",
-        ) from exc
-    if not value.is_finite() or value <= 0:
-        raise ConvertError(
-            400,
-            "invalid_amount",
-            "amount must be a number greater than zero.",
-        )
-    exponent = value.as_tuple().exponent
-    max_decimals = max_amount_decimals()
-    if isinstance(exponent, int) and exponent < -max_decimals:
-        raise ConvertError(
-            400,
-            "invalid_amount",
-            f"amount can have at most {max_decimals} decimal places.",
-        )
-    return value
-
-
-def parse_currency(raw: str | None, field: str) -> str:
-    if raw is None or raw.strip() == "":
-        raise ConvertError(
-            400,
-            "invalid_currency",
-            f"{field} is required and must be a 3-letter currency code.",
-        )
-    code = raw.strip().upper()
-    if len(code) != 3 or not code.isalpha():
-        raise ConvertError(
-            400,
-            "invalid_currency",
-            f"{field} must be a 3-letter currency code.",
-        )
-    return code
-
-
-def parse_asked_date(raw: str | None) -> date:
-    if raw is None or raw.strip() == "":
-        raise ConvertError(
-            400,
-            "invalid_date",
-            "date is required and must be YYYY-MM-DD.",
-        )
-    try:
-        asked = date.fromisoformat(raw.strip())
-    except ValueError as exc:
-        raise ConvertError(
-            400,
-            "invalid_date",
-            "date must be YYYY-MM-DD.",
-        ) from exc
-    today = datetime.now(timezone.utc).date()
-    if asked > today:
-        raise ConvertError(400, "date_in_future", "date cannot be in the future.")
-    series_start = series_start_date()
-    if asked < series_start:
-        raise ConvertError(
-            400,
-            "date_out_of_range",
-            f"date is before the ECB euro series starts ({series_start.isoformat()}).",
-        )
-    return asked
 
 
 def env_text(name: str, default: str) -> str:
@@ -170,6 +95,127 @@ def upstream_base() -> str:
     return env_text("FX_UPSTREAM_BASE", DEFAULT_UPSTREAM_BASE).rstrip("/")
 
 
+class ConvertQuery(BaseModel):
+    """Query string for GET /tools/convert. Extra rules live in the validators."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    amount: Decimal
+    from_: str = Field(alias="from")
+    to: str
+    date: date
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def validate_amount(cls, raw: object) -> Decimal:
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+            raise PydanticCustomError(
+                "invalid_amount",
+                "amount is required and must be a number greater than zero.",
+            )
+        text = raw.strip() if isinstance(raw, str) else str(raw)
+        try:
+            value = Decimal(text)
+        except InvalidOperation as exc:
+            raise PydanticCustomError(
+                "invalid_amount",
+                "amount must be a number greater than zero.",
+            ) from exc
+        if not value.is_finite() or value <= 0:
+            raise PydanticCustomError(
+                "invalid_amount",
+                "amount must be a number greater than zero.",
+            )
+        exponent = value.as_tuple().exponent
+        max_decimals = max_amount_decimals()
+        if isinstance(exponent, int) and exponent < -max_decimals:
+            raise PydanticCustomError(
+                "invalid_amount",
+                f"amount can have at most {max_decimals} decimal places.",
+            )
+        return value
+
+    @field_validator("from_", "to", mode="before")
+    @classmethod
+    def validate_currency(cls, raw: object, info: ValidationInfo) -> str:
+        field = "from" if info.field_name == "from_" else "to"
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+            raise PydanticCustomError(
+                "invalid_currency",
+                f"{field} is required and must be a 3-letter currency code.",
+            )
+        code = str(raw).strip().upper()
+        if len(code) != 3 or not code.isalpha():
+            raise PydanticCustomError(
+                "invalid_currency",
+                f"{field} must be a 3-letter currency code.",
+            )
+        return code
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def validate_date(cls, raw: object) -> date:
+        if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+            raise PydanticCustomError(
+                "invalid_date",
+                "date is required and must be YYYY-MM-DD.",
+            )
+        text = raw.strip() if isinstance(raw, str) else str(raw)
+        try:
+            asked = date.fromisoformat(text)
+        except ValueError as exc:
+            raise PydanticCustomError(
+                "invalid_date",
+                "date must be YYYY-MM-DD.",
+            ) from exc
+        today = datetime.now(timezone.utc).date()
+        if asked > today:
+            raise PydanticCustomError("date_in_future", "date cannot be in the future.")
+        series_start = series_start_date()
+        if asked < series_start:
+            raise PydanticCustomError(
+                "date_out_of_range",
+                f"date is before the ECB euro series starts ({series_start.isoformat()}).",
+            )
+        return asked
+
+    @field_validator("to")
+    @classmethod
+    def currencies_differ(cls, to_code: str, info: ValidationInfo) -> str:
+        from_code = info.data.get("from_")
+        if from_code is not None and from_code == to_code:
+            raise PydanticCustomError(
+                "same_currency",
+                "from and to must be different currency codes.",
+            )
+        return to_code
+
+
+def convert_error_from_validation(exc: ValidationError) -> ConvertError:
+    err = exc.errors()[0]
+    code = str(err.get("type") or "")
+    message = str(err.get("msg") or "the request was not valid.")
+    known = {
+        "invalid_amount",
+        "invalid_currency",
+        "invalid_date",
+        "date_in_future",
+        "date_out_of_range",
+        "same_currency",
+    }
+    if code in known:
+        return ConvertError(400, code, message)
+    loc = err.get("loc") or ()
+    field = loc[0] if loc else ""
+    if field == "amount":
+        return ConvertError(400, "invalid_amount", message)
+    if field in ("from", "from_", "to"):
+        return ConvertError(400, "invalid_currency", message)
+    if field == "date":
+        return ConvertError(400, "invalid_date", message)
+    return ConvertError(400, "invalid_amount", message)
+
+
 def upstream_message(response: httpx.Response) -> str:
     """Best-effort text from an error body. Empty if it is not JSON."""
     try:
@@ -190,7 +236,7 @@ def raise_for_upstream_status(response: httpx.Response) -> None:
     lowered = message.lower()
 
     # Frankfurter often answers 404 "not found" for an unknown code.
-    # Dates we cannot serve are already rejected in parse_asked_date, and
+    # Dates we cannot serve are already rejected in ConvertQuery, and
     # weekends/holidays are 200 with an earlier "date", not 404.
     if "currency" in lowered or response.status_code == 404:
         raise ConvertError(
@@ -314,32 +360,27 @@ def convert(
     date: str | None = None,
 ) -> JSONResponse:
     try:
-        parsed_amount = parse_amount(amount)
-        from_code = parse_currency(from_, "from")
-        to_code = parse_currency(to, "to")
-        if from_code == to_code:
-            raise ConvertError(
-                400,
-                "same_currency",
-                "from and to must be different currency codes.",
-            )
-        asked = parse_asked_date(date)
-        rate, rate_date = get_rate(from_code, to_code, asked)
+        query = ConvertQuery.model_validate(
+            {"amount": amount, "from": from_, "to": to, "date": date}
+        )
+        rate, rate_date = get_rate(query.from_, query.to, query.date)
+    except ValidationError as exc:
+        return error_body(convert_error_from_validation(exc))
     except ConvertError as exc:
         return error_body(exc)
 
-    amount_number = float(parsed_amount)
+    amount_number = float(query.amount)
     # Multiply only. The rate is used as published; we do not round it first.
     result = round(amount_number * rate, 2)
     return JSONResponse(
         {
             "amount": amount_number,
-            "from": from_code,
-            "to": to_code,
+            "from": query.from_,
+            "to": query.to,
             "rate": rate,
             "result": result,
             "rate_date": rate_date,
-            "asked_date": asked.isoformat(),
+            "asked_date": query.date.isoformat(),
             "source": source_label(),
         }
     )
