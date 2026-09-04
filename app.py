@@ -11,13 +11,12 @@ from fastapi.responses import JSONResponse
 # The application object uvicorn loads from this file.
 app = FastAPI(title="fx-convert")
 
-SOURCE = "ECB via frankfurter.dev"
-MAX_AMOUNT_DECIMALS = 6
-ECB_SERIES_START = date(1999, 1, 4)
-# Default of the env var only. Requests always read FX_UPSTREAM_BASE so
-# reviewers can point the app at a fake host.
+# Defaults for env vars. Every request reads the env so reviewers can override.
 DEFAULT_UPSTREAM_BASE = "https://api.frankfurter.dev"
-UPSTREAM_TIMEOUT_SECONDS = 3.0
+DEFAULT_SOURCE = "ECB via frankfurter.dev"
+DEFAULT_TIMEOUT_SECONDS = 3.0
+DEFAULT_MAX_AMOUNT_DECIMALS = 6
+DEFAULT_SERIES_START = date(1999, 1, 4)
 
 # (from, to, asked_date) -> (rate, rate_date). Failures are not stored.
 _cache: dict[tuple[str, str, str], tuple[float, str]] = {}
@@ -64,11 +63,12 @@ def parse_amount(raw: str | None) -> Decimal:
             "amount must be a number greater than zero.",
         )
     exponent = value.as_tuple().exponent
-    if isinstance(exponent, int) and exponent < -MAX_AMOUNT_DECIMALS:
+    max_decimals = max_amount_decimals()
+    if isinstance(exponent, int) and exponent < -max_decimals:
         raise ConvertError(
             400,
             "invalid_amount",
-            f"amount can have at most {MAX_AMOUNT_DECIMALS} decimal places.",
+            f"amount can have at most {max_decimals} decimal places.",
         )
     return value
 
@@ -108,18 +108,66 @@ def parse_asked_date(raw: str | None) -> date:
     today = datetime.now(timezone.utc).date()
     if asked > today:
         raise ConvertError(400, "date_in_future", "date cannot be in the future.")
-    if asked < ECB_SERIES_START:
+    series_start = series_start_date()
+    if asked < series_start:
         raise ConvertError(
             400,
             "date_out_of_range",
-            "date is before the ECB euro series starts (1999-01-04).",
+            f"date is before the ECB euro series starts ({series_start.isoformat()}).",
         )
     return asked
 
 
+def env_text(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip()
+
+
+def max_amount_decimals() -> int:
+    raw = os.environ.get("FX_MAX_AMOUNT_DECIMALS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_MAX_AMOUNT_DECIMALS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_AMOUNT_DECIMALS
+    if value < 0:
+        return DEFAULT_MAX_AMOUNT_DECIMALS
+    return value
+
+
+def series_start_date() -> date:
+    raw = os.environ.get("FX_SERIES_START")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_SERIES_START
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return DEFAULT_SERIES_START
+
+
+def timeout_seconds() -> float:
+    raw = os.environ.get("FX_TIMEOUT_SECONDS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_TIMEOUT_SECONDS
+    if value <= 0:
+        return DEFAULT_TIMEOUT_SECONDS
+    return value
+
+
+def source_label() -> str:
+    return env_text("FX_SOURCE", DEFAULT_SOURCE)
+
+
 def upstream_base() -> str:
     # Strip a trailing slash so we never build ...dev//v1/...
-    return os.environ.get("FX_UPSTREAM_BASE", DEFAULT_UPSTREAM_BASE).rstrip("/")
+    return env_text("FX_UPSTREAM_BASE", DEFAULT_UPSTREAM_BASE).rstrip("/")
 
 
 def upstream_message(response: httpx.Response) -> str:
@@ -174,7 +222,7 @@ def fetch_rate(from_code: str, to_code: str, asked: date) -> tuple[float, str]:
     url = f"{upstream_base()}/v1/{asked.isoformat()}"
     try:
         with httpx.Client(
-            timeout=UPSTREAM_TIMEOUT_SECONDS,
+            timeout=timeout_seconds(),
             transport=_transport,
         ) as client:
             response = client.get(
@@ -292,6 +340,6 @@ def convert(
             "result": result,
             "rate_date": rate_date,
             "asked_date": asked.isoformat(),
-            "source": SOURCE,
+            "source": source_label(),
         }
     )

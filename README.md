@@ -25,7 +25,15 @@ pip install -r requirements.txt
 ./run.sh                           # PORT defaults to 8080
 ```
 
-`FX_UPSTREAM_BASE` defaults to `https://api.frankfurter.dev`. The host is never hardcoded; set this env var to point at another upstream.
+`PORT` defaults to `8080`. Other settings are also env vars with defaults (override only if you need to):
+
+| Variable | Default |
+|---|---|
+| `FX_UPSTREAM_BASE` | `https://api.frankfurter.dev` (never hardcoded in `run.sh`) |
+| `FX_TIMEOUT_SECONDS` | `3` |
+| `FX_MAX_AMOUNT_DECIMALS` | `6` |
+| `FX_SERIES_START` | `1999-01-04` |
+| `FX_SOURCE` | `ECB via frankfurter.dev` |
 
 ## Test
 
